@@ -74,6 +74,9 @@ class CommentsManager:
         # 2. Swap in Relationships (The Fix for Duplicate Warnings)
         # Scan relationships on the main document part and update targets
         for rel in self.doc.part.rels.values():
+            # Skip external relationships (hyperlinks, etc.) - they don't have target_part
+            if rel._is_external:
+                continue
             if rel.target_part == part:
                 rel._target = xml_part
 
@@ -105,6 +108,9 @@ class CommentsManager:
 
         # Check relationships manually to be safe (in case cache is stale)
         for rel in self.doc.part.rels.values():
+            # Skip external relationships (hyperlinks, etc.) - they don't have target_part
+            if rel._is_external:
+                continue
             if rel.target_part == part:
                 return part
 
