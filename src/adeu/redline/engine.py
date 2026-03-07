@@ -11,7 +11,7 @@ from docx import Document
 from docx.oxml.ns import nsmap, qn
 from docx.text.run import Run
 
-from adeu.models import DocumentEdit, EditOperationType, ReviewAction
+from adeu.models import DocumentEdit, EditOperationType, EditResult, EditStatus, ReviewAction
 from adeu.redline.comments import CommentsManager
 from adeu.redline.mapper import DocumentMapper
 from adeu.utils.docx import create_attribute, create_element, normalize_docx
@@ -146,6 +146,24 @@ class RedlineEngine:
         self.mapper = DocumentMapper(self.doc)
         self.comments_manager = CommentsManager(self.doc)
         self.clean_mapper: Optional[DocumentMapper] = None
+        # Результаты последнего вызова apply_edits()
+        self._last_edit_results: List[EditResult] = []
+
+    def _build_context_with_markup(
+        self,
+        matched_text: str,
+        new_text: str,
+    ) -> str:
+        """
+        Формирует CriticMarkup разметку для изменения.
+
+        Не извлекает контекст из full_text, т.к. он может содержать
+        существующие Track Changes и CriticMarkup разметку.
+
+        Returns:
+            Строка вида: "{--старый--}{++новый++}"
+        """
+        return f"{{--{matched_text}--}}{{++{new_text}++}}"
 
     def _scan_existing_ids(self) -> int:
         """
@@ -534,6 +552,9 @@ class RedlineEngine:
             pass
 
     def apply_edits(self, edits: List[DocumentEdit]) -> tuple[int, int]:
+        # Очищаем результаты предыдущего вызова
+        self._last_edit_results = []
+
         indexed_edits = [e for e in edits if e._match_start_index is not None]
         unindexed_edits = [e for e in edits if e._match_start_index is None]
 
@@ -549,12 +570,37 @@ class RedlineEngine:
             end = start + (len(edit.target_text) if edit.target_text else 0)
             if any(start < occ_end and end > occ_start for occ_start, occ_end in occupied_ranges):
                 logger.warning(f"Skipping overlapping edit at index {start}")
+                self._last_edit_results.append(EditResult(
+                    target_text=edit.target_text,
+                    new_text=edit.new_text or "",
+                    comment=edit.comment,
+                    status=EditStatus.SKIPPED_OVERLAP,
+                ))
                 skipped += 1
                 continue
+            # Формируем CriticMarkup для обратной связи
+            context_markup = self._build_context_with_markup(
+                edit.target_text, edit.new_text or "",
+            )
             if self._apply_single_edit_indexed(edit):
+                # Для indexed edits matched_text совпадает с target_text
+                self._last_edit_results.append(EditResult(
+                    target_text=edit.target_text,
+                    new_text=edit.new_text or "",
+                    comment=edit.comment,
+                    status=EditStatus.APPLIED,
+                    matched_text=edit.target_text,
+                    context_with_markup=context_markup,
+                ))
                 applied += 1
                 occupied_ranges.append((start, end))
             else:
+                self._last_edit_results.append(EditResult(
+                    target_text=edit.target_text,
+                    new_text=edit.new_text or "",
+                    comment=edit.comment,
+                    status=EditStatus.SKIPPED_NOT_FOUND,
+                ))
                 skipped += 1
 
         # Heuristic Second
@@ -569,21 +615,68 @@ class RedlineEngine:
                         end_idx = start_idx + match_len
                         if any(start_idx < occ_end and end_idx > occ_start for occ_start, occ_end in occupied_ranges):
                             logger.warning(f"Skipping overlapping heuristic edit at index {start_idx}")
+                            self._last_edit_results.append(EditResult(
+                                target_text=edit.target_text,
+                                new_text=edit.new_text or "",
+                                comment=edit.comment,
+                                status=EditStatus.SKIPPED_OVERLAP,
+                            ))
                             skipped += 1
                             continue
+                        # Получаем matched_text для обратной связи
+                        matched_text = self.mapper.full_text[start_idx:end_idx]
+                        # Формируем CriticMarkup
+                        context_markup = self._build_context_with_markup(
+                            matched_text, edit.new_text or "",
+                        )
                         if self._apply_single_edit_heuristic(edit):
+                            self._last_edit_results.append(EditResult(
+                                target_text=edit.target_text,
+                                new_text=edit.new_text or "",
+                                comment=edit.comment,
+                                status=EditStatus.APPLIED,
+                                matched_text=matched_text,
+                                context_with_markup=context_markup,
+                            ))
                             applied += 1
                             occupied_ranges.append((start_idx, end_idx))
                             self.mapper._build_map()
                         else:
+                            self._last_edit_results.append(EditResult(
+                                target_text=edit.target_text,
+                                new_text=edit.new_text or "",
+                                comment=edit.comment,
+                                status=EditStatus.SKIPPED_NOT_FOUND,
+                            ))
                             skipped += 1
                         continue
+                # target_text not found or empty
                 if self._apply_single_edit_heuristic(edit):
+                    self._last_edit_results.append(EditResult(
+                        target_text=edit.target_text,
+                        new_text=edit.new_text or "",
+                        comment=edit.comment,
+                        status=EditStatus.APPLIED,
+                        matched_text=edit.target_text,  # Fallback
+                    ))
                     applied += 1
                     self.mapper._build_map()
                 else:
+                    self._last_edit_results.append(EditResult(
+                        target_text=edit.target_text,
+                        new_text=edit.new_text or "",
+                        comment=edit.comment,
+                        status=EditStatus.SKIPPED_NOT_FOUND,
+                    ))
                     skipped += 1
         return applied, skipped
+
+    def get_edit_results(self) -> List[EditResult]:
+        """
+        Возвращает детальные результаты последнего вызова apply_edits().
+        Каждый EditResult содержит статус и информацию о найденном тексте.
+        """
+        return self._last_edit_results
 
     def _apply_single_edit_heuristic(self, edit: DocumentEdit) -> bool:
         if not edit.target_text:

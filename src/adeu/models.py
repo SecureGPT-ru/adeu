@@ -48,6 +48,38 @@ class DocumentEdit(BaseModel):
     _active_mapper_ref: Optional[DocumentMapper] = PrivateAttr(default=None)
 
 
+class EditStatus(str, Enum):
+    """Статус применения одной правки."""
+    APPLIED = "applied"
+    SKIPPED_NOT_FOUND = "skipped_not_found"
+    SKIPPED_OVERLAP = "skipped_overlap"
+
+
+class EditResult(BaseModel):
+    """
+    Результат применения одной правки.
+    Содержит детальную информацию о том, что произошло при применении.
+    """
+
+    # Входные данные (что просили)
+    target_text: str = Field(..., description="Исходный target_text из DocumentEdit")
+    new_text: str = Field(..., description="Исходный new_text из DocumentEdit")
+    comment: Optional[str] = Field(None, description="Комментарий к правке (если был)")
+
+    # Результат
+    status: EditStatus = Field(..., description="Статус: applied, skipped_not_found, skipped_overlap")
+
+    # Детали (только если status == APPLIED)
+    matched_text: Optional[str] = Field(
+        None,
+        description="Текст, который реально был найден (может отличаться из-за fuzzy matching)"
+    )
+    context_with_markup: Optional[str] = Field(
+        None,
+        description="Фрагмент документа с CriticMarkup: ~80 символов до + {--old--}{++new++} + ~80 символов после"
+    )
+
+
 class ReviewActionType(str, Enum):
     ACCEPT = "ACCEPT"
     REJECT = "REJECT"
