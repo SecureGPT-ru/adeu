@@ -935,31 +935,102 @@ class RedlineEngine:
             else:
                 skipped += 1
 
+        if applied > 0:
+            normalize_docx(self.doc)
+
         return applied, skipped
+
+    def _clean_wrapping_comments(self, element):
+        """
+        Removes comment anchors that tightly wrap this element (or a paired del/ins).
+        This prevents orphaned comment ranges from leaking when an edit is accepted/rejected.
+        """
+        # 1. Collect tightly adjacent Start anchors (looking backwards)
+        starts_to_remove = []
+        prev = element.getprevious()
+        while prev is not None:
+            if prev.tag == qn("w:commentRangeStart"):
+                starts_to_remove.append(prev)
+                prev = prev.getprevious()
+            elif prev.tag in (qn("w:rPr"), qn("w:pPr")):
+                prev = prev.getprevious()
+            else:
+                break
+
+        # 2. Collect tightly adjacent End/Ref anchors (looking forwards)
+        ends_to_remove = []
+        nxt = element.getnext()
+        while nxt is not None:
+            if nxt.tag == qn("w:commentRangeEnd"):
+                ends_to_remove.append(nxt)
+                nxt = nxt.getnext()
+            elif nxt.tag == qn("w:r") and nxt.find(f".//{qn('w:commentReference')}") is not None:
+                ends_to_remove.append(nxt)
+                nxt = nxt.getnext()
+            elif nxt.tag == qn("w:commentReference"):
+                ends_to_remove.append(nxt)
+                nxt = nxt.getnext()
+            elif nxt.tag in (qn("w:ins"), qn("w:del")):
+                # CRITICAL: Skip over paired edits (e.g. if we are rejecting w:del, skip the w:ins
+                # so we can find the end anchor that wraps both!)
+                nxt = nxt.getnext()
+            else:
+                break
+
+        # 3. Match pairs and delete
+        end_ids = set()
+        for e in ends_to_remove:
+            if e.tag == qn("w:commentRangeEnd"):
+                end_ids.add(e.get(qn("w:id")))
+            else:
+                ref = e.find(f".//{qn('w:commentReference')}")
+                if ref is None and e.tag == qn("w:commentReference"):
+                    ref = e
+                if ref is not None:
+                    end_ids.add(ref.get(qn("w:id")))
+
+        # If a Start matches an End in our tight bounds, it's our comment. Nuke it.
+        for s in starts_to_remove:
+            c_id = s.get(qn("w:id"))
+            if c_id and c_id in end_ids:
+                # Purge from the 4 XML parts
+                self.comments_manager.delete_comment(c_id)
+                # Remove Start from DOM
+                s.getparent().remove(s)
+                # Remove Ends/Refs from DOM
+                for e in ends_to_remove:
+                    e_id = None
+                    if e.tag == qn("w:commentRangeEnd"):
+                        e_id = e.get(qn("w:id"))
+                    else:
+                        ref = e.find(f".//{qn('w:commentReference')}")
+                        if ref is None and e.tag == qn("w:commentReference"):
+                            ref = e
+                        if ref is not None:
+                            e_id = ref.get(qn("w:id"))
+
+                    if e_id == c_id and e.getparent() is not None:
+                        e.getparent().remove(e)
 
     def _delete_comments_in_element(self, element):
         """
-        Scans a DOM element scheduled for deletion for comment references.
-        If found, deletes the comment from the XML parts and cleans up stray Range tags globally.
+        Scans a DOM element scheduled for deletion for strictly encapsulated comment references.
         """
-        # FIX: Use findall with qn() to avoid XPath namespace errors
         refs = element.findall(f".//{qn('w:commentReference')}")
         for ref in refs:
             c_id = ref.get(qn("w:id"))
             if c_id:
-                # 1. Clean from all 4 comment XML parts
                 self.comments_manager.delete_comment(c_id)
-
-                # 2. Strip any stray Range start/end tags from the whole document
                 for tag in ["w:commentRangeStart", "w:commentRangeEnd"]:
                     for node in self.doc.element.findall(f".//{qn(tag)}"):
-                        if node.get(qn("w:id")) == c_id:
-                            if node.getparent() is not None:
-                                node.getparent().remove(node)
+                        if node.get(qn("w:id")) == c_id and node.getparent() is not None:
+                            node.getparent().remove(node)
 
     def _accept_change(self, target_id: str) -> bool:
-        ins_nodes = self.doc.element.xpath(f"//w:ins[@w:id='{target_id}']")
+        ins_nodes = self.doc.element.findall(f".//{qn('w:ins')}")
+        ins_nodes = [n for n in ins_nodes if n.get(qn("w:id")) == target_id]
         for ins in ins_nodes:
+            self._clean_wrapping_comments(ins)
             parent = ins.getparent()
             index = parent.index(ins)
             for child in list(ins):
@@ -967,25 +1038,31 @@ class RedlineEngine:
                 index += 1
             parent.remove(ins)
 
-        del_nodes = self.doc.element.xpath(f"//w:del[@w:id='{target_id}']")
+        del_nodes = self.doc.element.findall(f".//{qn('w:del')}")
+        del_nodes = [n for n in del_nodes if n.get(qn("w:id")) == target_id]
         for d in del_nodes:
+            self._clean_wrapping_comments(d)
             self._delete_comments_in_element(d)
             d.getparent().remove(d)
 
         return bool(ins_nodes or del_nodes)
 
     def _reject_change(self, target_id: str) -> bool:
-        ins_nodes = self.doc.element.xpath(f"//w:ins[@w:id='{target_id}']")
+        ins_nodes = self.doc.element.findall(f".//{qn('w:ins')}")
+        ins_nodes = [n for n in ins_nodes if n.get(qn("w:id")) == target_id]
         for ins in ins_nodes:
+            self._clean_wrapping_comments(ins)
             self._delete_comments_in_element(ins)
             ins.getparent().remove(ins)
 
-        del_nodes = self.doc.element.xpath(f"//w:del[@w:id='{target_id}']")
+        del_nodes = self.doc.element.findall(f".//{qn('w:del')}")
+        del_nodes = [n for n in del_nodes if n.get(qn("w:id")) == target_id]
         for d in del_nodes:
+            self._clean_wrapping_comments(d)
             parent = d.getparent()
             index = parent.index(d)
             for child in list(d):
-                for dt in child.findall(qn("w:delText")):
+                for dt in child.findall(f".//{qn('w:delText')}"):
                     dt.tag = qn("w:t")
                 parent.insert(index, child)
                 index += 1
