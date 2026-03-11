@@ -436,7 +436,12 @@ class RedlineEngine:
         pPr.append(pStyle)
         p_element.insert(0, pPr)
 
-    def _track_insert_inline(self, text: str, anchor_run: Optional[Run] = None, suppress_inherited: bool = False):
+    def _track_insert_inline(
+        self,
+        text: str,
+        anchor_run: Optional[Run] = None,
+        suppress_inherited: bool = False,
+    ):
         ins = self._create_track_change_tag("w:ins")
 
         segments = self._parse_inline_markdown(text)
@@ -456,6 +461,46 @@ class RedlineEngine:
 
         return ins
 
+    def _insert_and_split_ins(self, parent_ins, split_index: int, new_elem):
+        """
+        Splits a w:ins element to insert a new element (like w:del or another w:ins)
+        without creating invalid nested w:ins tags.
+        """
+        grandparent = parent_ins.getparent()
+        if grandparent is None:
+            return
+
+        parent_index = grandparent.index(parent_ins)
+
+        left_ins = create_element("w:ins")
+        for attr, val in parent_ins.attrib.items():
+            left_ins.set(attr, val)
+
+        right_ins = create_element("w:ins")
+        for attr, val in parent_ins.attrib.items():
+            right_ins.set(attr, val)
+
+        # Snapshot children to safely extract them across loops
+        children = list(parent_ins)
+        for child in children[:split_index]:
+            left_ins.append(child)
+        for child in children[split_index:]:
+            right_ins.append(child)
+
+        insert_idx = parent_index
+        if len(left_ins) > 0:
+            grandparent.insert(insert_idx, left_ins)
+            insert_idx += 1
+
+        if new_elem is not None:
+            grandparent.insert(insert_idx, new_elem)
+            insert_idx += 1
+
+        if len(right_ins) > 0:
+            grandparent.insert(insert_idx, right_ins)
+
+        grandparent.remove(parent_ins)
+
     def track_delete_run(self, run: Run):
         del_tag = self._create_track_change_tag("w:del")
         new_run = create_element("w:r")
@@ -466,9 +511,47 @@ class RedlineEngine:
         self._set_text_content(del_text, text_content)
         new_run.append(del_text)
         del_tag.append(new_run)
+
         parent = run._r.getparent()
         if parent is None:
             return None
+
+        if parent.tag == qn("w:ins"):
+            grandparent = parent.getparent()
+            if grandparent is not None:
+                parent_index = grandparent.index(parent)
+                run_index = parent.index(run._r)
+
+                left_ins = create_element("w:ins")
+                for attr, val in parent.attrib.items():
+                    left_ins.set(attr, val)
+
+                right_ins = create_element("w:ins")
+                for attr, val in parent.attrib.items():
+                    right_ins.set(attr, val)
+
+                # Snapshot children to safely extract them across loops
+                children = list(parent)
+                for child in children[:run_index]:
+                    left_ins.append(child)
+                # Skip the run being deleted
+                for child in children[run_index + 1 :]:
+                    right_ins.append(child)
+
+                insert_idx = parent_index
+                if len(left_ins) > 0:
+                    grandparent.insert(insert_idx, left_ins)
+                    insert_idx += 1
+
+                grandparent.insert(insert_idx, del_tag)
+                insert_idx += 1
+
+                if len(right_ins) > 0:
+                    grandparent.insert(insert_idx, right_ins)
+
+                grandparent.remove(parent)
+                return del_tag
+
         parent.replace(run._r, del_tag)
         return del_tag
 
@@ -611,30 +694,6 @@ class RedlineEngine:
         else:
             active_mapper = self.mapper
 
-        # --- HEURISTIC NESTED EDIT FIX ---
-        context_span = active_mapper.get_context_at_range(start_idx, start_idx + match_len)
-
-        if context_span and context_span.ins_id:
-            ins_id = context_span.ins_id
-            ins_spans = [s for s in active_mapper.spans if s.ins_id == ins_id]
-            if ins_spans:
-                ins_start = ins_spans[0].start
-                full_ins_text = "".join(s.text for s in ins_spans)
-                rel_start = start_idx - ins_start
-
-                expanded_new_text = (
-                    full_ins_text[:rel_start] + (edit.new_text or "") + full_ins_text[rel_start + match_len :]
-                )
-
-                proxy_edit = DocumentEdit(
-                    target_text=full_ins_text,
-                    new_text=expanded_new_text,
-                    comment=edit.comment,
-                )
-                proxy_edit._match_start_index = ins_start
-                return self._apply_single_edit_indexed(proxy_edit)
-        # ---------------------------------
-
         effective_new_text = edit.new_text or ""
         actual_doc_text = self.mapper.full_text[start_idx : start_idx + match_len]
 
@@ -690,35 +749,43 @@ class RedlineEngine:
 
         logger.debug(f"Applying Edit at [{start_idx}:{start_idx + length}] Op={op}")
 
-        if length > 0:
-            context_span = self.mapper.get_context_at_range(start_idx, start_idx + length)
-            if context_span and context_span.ins_id:
-                logger.info(f"Detected edit inside Insertion ID={context_span.ins_id}. Converting to Replace.")
-                ins_id = context_span.ins_id
-                ins_nodes = self.doc.element.xpath(f"//w:ins[@w:id='{ins_id}']")
-                if not ins_nodes:
-                    return False
+        if op == EditOperationType.INSERTION:
+            anchor_run = self.mapper.get_insertion_anchor(start_idx)
+            if not anchor_run:
+                return False
 
-                first_node = ins_nodes[0]
-                parent = first_node.getparent()
-                index = parent.index(first_node)
+            parent = anchor_run._element.getparent()
+            index = parent.index(anchor_run._element)
 
-                style_source = None
-                r = first_node.find(qn("w:r"))
-                if r is not None:
-                    style_source = Run(r, parent)
+            final_new_text = edit.new_text or ""
 
-                self._reject_change(ins_id)
-
-                if edit.new_text:
-                    ins_elem = self.track_insert(edit.new_text, anchor_run=style_source, comment=edit.comment)
-                    if ins_elem is not None:
+            if start_idx == 0:
+                ins_elem = self.track_insert(final_new_text, anchor_run=anchor_run, comment=edit.comment)
+                if ins_elem is not None:
+                    if parent.tag == qn("w:ins"):
+                        self._insert_and_split_ins(parent, index, ins_elem)
+                        actual_parent = parent.getparent()
+                    else:
                         parent.insert(index, ins_elem)
+                        actual_parent = parent
 
-                    if edit.comment and ins_elem is not None:
-                        self._attach_comment(parent, ins_elem, ins_elem, edit.comment)
+                    if edit.comment:
+                        self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+            else:
+                next_run = self._get_next_run(anchor_run)
+                style_run = self._determine_style_source(anchor_run, next_run, final_new_text)
+                ins_elem = self.track_insert(final_new_text, anchor_run=style_run, comment=edit.comment)
+                if ins_elem is not None:
+                    if parent.tag == qn("w:ins"):
+                        self._insert_and_split_ins(parent, index + 1, ins_elem)
+                        actual_parent = parent.getparent()
+                    else:
+                        parent.insert(index + 1, ins_elem)
+                        actual_parent = parent
 
-                return True
+                    if edit.comment:
+                        self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+            return True
 
         if op == EditOperationType.INSERTION:
             anchor_run = self.mapper.get_insertion_anchor(start_idx)

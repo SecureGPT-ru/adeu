@@ -298,39 +298,41 @@ def _has_special_content(run: Run) -> bool:
     return False
 
 
+def _coalesce_runs_in_container(container_element, parent_paragraph):
+    children = list(container_element)
+    i = 0
+    while i < len(children) - 1:
+        curr = children[i]
+        nxt = children[i + 1]
+
+        if curr.tag == qn("w:r") and nxt.tag == qn("w:r"):
+            r1 = Run(curr, parent_paragraph)
+            r2 = Run(nxt, parent_paragraph)
+            if not _has_special_content(r1) and not _has_special_content(r2):
+                if _are_runs_identical(r1, r2):
+                    for child in list(nxt):
+                        if child.tag == qn("w:rPr"):
+                            continue
+                        curr.append(child)
+                    container_element.remove(nxt)
+                    children.pop(i + 1)
+                    continue
+
+        if curr.tag in (qn("w:ins"), qn("w:del")):
+            _coalesce_runs_in_container(curr, parent_paragraph)
+
+        i += 1
+
+    if children and children[-1].tag in (qn("w:ins"), qn("w:del")):
+        _coalesce_runs_in_container(children[-1], parent_paragraph)
+
+
 def _coalesce_runs_in_paragraph(paragraph: Paragraph):
     """
     Merges adjacent runs with identical formatting.
     This fixes issues where words are split like ["Con", "tract"] due to editing history.
     """
-    i = 0
-    # Safe iteration while modifying the list
-    while i < len(paragraph.runs) - 1:
-        current_run = paragraph.runs[i]
-        next_run = paragraph.runs[i + 1]
-
-        # Do not merge if either run has special content (comments, images, etc.)
-        # Merging simply concatenates .text and deletes the second node,
-        # which would destroy the special XML elements.
-        if _has_special_content(current_run) or _has_special_content(next_run):
-            i += 1
-            continue
-
-        if _are_runs_identical(current_run, next_run):
-            # Merge content
-            # We must move children nodes manually to preserve w:br, w:tab, etc.
-            # python-docx's run.text += ... destroys these tags.
-            for child in list(next_run._element):
-                if child.tag == qn("w:rPr"):
-                    continue
-                # Append content child to current_run
-                current_run._element.append(child)
-
-            # Remove next_run from the XML tree
-            paragraph._p.remove(next_run._r)
-            # Do NOT increment i; check the *new* next_run against current_run
-        else:
-            i += 1
+    _coalesce_runs_in_container(paragraph._element, paragraph)
 
 
 def iter_document_parts(doc: DocumentObject):

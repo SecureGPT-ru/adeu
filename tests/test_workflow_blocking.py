@@ -48,8 +48,8 @@ def test_repro_workflow_blocking():
 
     # Should contain Round2
     assert "Round2" in final_text
-    # Should NOT contain Round1
-    assert "Round1" not in final_text
+    # Round1 should be tracked as deleted natively instead of wiped entirely
+    assert "{--Round1--}" in final_text
 
 
 def test_repro_workflow_blocking_target_with_markup():
