@@ -53,9 +53,7 @@ def test_repro_accept_resolves_paired_modification():
     assert "Old" not in text_final, "Old Text should be removed"
 
     # 2. New Text should be PRESENT as normal text (Accepted paired Insertion)
-    assert (
-        "{++New++}" not in text_final
-    ), "New Text tracking wrapper should be removed by paired resolution"
+    assert "{++New++}" not in text_final, "New Text tracking wrapper should be removed by paired resolution"
     assert "New Text" in text_final, "New Text content should remain in the document"
 
 
