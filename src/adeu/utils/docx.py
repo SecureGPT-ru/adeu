@@ -186,53 +186,37 @@ def iter_paragraph_content(paragraph: Paragraph) -> Iterator[ParagraphItem]:
         if not hide_result:
             yield Run(r_element, paragraph)
 
-    # Iterate over all children of the paragraph XML element
-    for child in paragraph._element:
-        tag = child.tag
-        if tag == qn("w:r"):
-            # Standard run
-            yield from process_run_element(child)
-        elif tag == qn("w:ins"):
-            i_id = child.get(qn("w:id"))
-            i_auth = child.get(qn("w:author"))
-            i_date = child.get(qn("w:date"))
-            yield DocxEvent("ins_start", i_id, i_auth, i_date)
+    def traverse_node(node):
+        for child in node:
+            tag = child.tag
+            if tag == qn("w:r"):
+                # Standard run
+                yield from process_run_element(child)
+            elif tag == qn("w:ins"):
+                i_id = child.get(qn("w:id"))
+                i_auth = child.get(qn("w:author"))
+                i_date = child.get(qn("w:date"))
+                yield DocxEvent("ins_start", i_id, i_auth, i_date)
+                yield from traverse_node(child)
+                yield DocxEvent("ins_end", i_id)
+            elif tag == qn("w:del"):
+                d_id = child.get(qn("w:id"))
+                d_auth = child.get(qn("w:author"))
+                d_date = child.get(qn("w:date"))
+                yield DocxEvent("del_start", d_id, d_auth, d_date)
+                yield from traverse_node(child)
+                yield DocxEvent("del_end", d_id)
+            elif tag == qn("w:commentRangeStart"):
+                c_id = child.get(qn("w:id"))
+                yield DocxEvent("start", c_id)
+            elif tag == qn("w:commentRangeEnd"):
+                c_id = child.get(qn("w:id"))
+                yield DocxEvent("end", c_id)
+            elif tag == qn("w:commentReference"):
+                # Reference directly in paragraph
+                pass
 
-            # Inserted runs (Track Changes)
-            for subchild in child:
-                if subchild.tag == qn("w:r"):
-                    yield from process_run_element(subchild)
-                elif subchild.tag == qn("w:commentRangeStart"):
-                    c_id = subchild.get(qn("w:id"))
-                    yield DocxEvent("start", c_id)
-                elif subchild.tag == qn("w:commentRangeEnd"):
-                    c_id = subchild.get(qn("w:id"))
-                    yield DocxEvent("end", c_id)
-            yield DocxEvent("ins_end", i_id)
-
-        elif tag == qn("w:del"):
-            d_id = child.get(qn("w:id"))
-            d_auth = child.get(qn("w:author"))
-            d_date = child.get(qn("w:date"))
-            yield DocxEvent("del_start", d_id, d_auth, d_date)
-
-            # Deletions contain runs (w:delText inside w:r)
-            for subchild in child:
-                if subchild.tag == qn("w:r"):
-                    yield Run(subchild, paragraph)
-            yield DocxEvent("del_end", d_id)
-
-        elif tag == qn("w:commentRangeStart"):
-            c_id = child.get(qn("w:id"))
-            yield DocxEvent("start", c_id)
-
-        elif tag == qn("w:commentRangeEnd"):
-            c_id = child.get(qn("w:id"))
-            yield DocxEvent("end", c_id)
-
-        elif tag == qn("w:commentReference"):
-            # Reference directly in paragraph
-            pass
+    yield from traverse_node(paragraph._element)
 
 
 def get_visible_runs(paragraph: Paragraph):
