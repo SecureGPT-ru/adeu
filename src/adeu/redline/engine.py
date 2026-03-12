@@ -153,17 +153,61 @@ class RedlineEngine:
         self,
         matched_text: str,
         new_text: str,
+        start_idx: Optional[int] = None,
+        end_idx: Optional[int] = None,
+        full_text: Optional[str] = None,
+        context_chars: int = 60,
     ) -> str:
         """
-        Формирует CriticMarkup разметку для изменения.
+        Формирует CriticMarkup разметку для изменения с окружающим контекстом.
 
-        Не извлекает контекст из full_text, т.к. он может содержать
-        существующие Track Changes и CriticMarkup разметку.
+        Извлекает ~context_chars символов до и после замены из full_text,
+        чтобы пользователь видел где именно в документе произошло изменение.
+
+        Args:
+            matched_text: Текст, который был найден и заменён
+            new_text: Новый текст замены
+            start_idx: Позиция начала matched_text в full_text
+            end_idx: Позиция конца matched_text в full_text
+            full_text: Полный текст документа (snapshot до применения правки)
+            context_chars: Количество символов контекста с каждой стороны (default: 60)
 
         Returns:
-            Строка вида: "{--старый--}{++новый++}"
+            Строка вида: "...текст до... {--старый--}{++новый++} ...текст после..."
+            Если индексы недоступны, возвращает только "{--старый--}{++новый++}"
         """
-        return f"{{--{matched_text}--}}{{++{new_text}++}}"
+        # Ограничиваем длину matched_text в разметке (для читаемости)
+        max_match_len = 150
+        display_matched = matched_text
+        if len(matched_text) > max_match_len:
+            display_matched = matched_text[:max_match_len] + "..."
+
+        display_new = new_text
+        if len(new_text) > max_match_len:
+            display_new = new_text[:max_match_len] + "..."
+
+        markup = f"{{--{display_matched}--}}{{++{display_new}++}}"
+
+        # Если индексы или full_text недоступны, возвращаем только разметку
+        if start_idx is None or end_idx is None or full_text is None:
+            return markup
+
+        # Извлекаем контекст до и после
+        before_start = max(0, start_idx - context_chars)
+        after_end = min(len(full_text), end_idx + context_chars)
+
+        before = full_text[before_start:start_idx]
+        after = full_text[end_idx:after_end]
+
+        # Нормализуем whitespace (заменяем переносы на пробелы для читаемости)
+        before = before.replace('\n', ' ').replace('\r', ' ')
+        after = after.replace('\n', ' ').replace('\r', ' ')
+
+        # Добавляем ... если обрезали текст
+        prefix = "..." if before_start > 0 else ""
+        suffix = "..." if after_end < len(full_text) else ""
+
+        return f"{prefix}{before}{markup}{after}{suffix}"
 
     def _get_paired_nodes(self, node):
         """
@@ -763,6 +807,8 @@ class RedlineEngine:
 
         # Indexed First (Reverse Order)
         indexed_edits.sort(key=lambda x: x._match_start_index or 0, reverse=True)
+        # Сохраняем snapshot full_text до применения indexed правок для извлечения контекста
+        indexed_full_text_snapshot = self.mapper.full_text if hasattr(self, 'mapper') else None
         for edit in indexed_edits:
             # Fix 5.6: Prevent collisions from overlapping edits
             start = edit._match_start_index or 0
@@ -777,9 +823,13 @@ class RedlineEngine:
                 ))
                 skipped += 1
                 continue
-            # Формируем CriticMarkup для обратной связи
+            # Формируем CriticMarkup с контекстом для обратной связи
             context_markup = self._build_context_with_markup(
-                edit.target_text, edit.new_text or "",
+                edit.target_text,
+                edit.new_text or "",
+                start_idx=start,
+                end_idx=end,
+                full_text=indexed_full_text_snapshot,
             )
             if self._apply_single_edit_indexed(edit):
                 # Для indexed edits matched_text совпадает с target_text
@@ -822,11 +872,17 @@ class RedlineEngine:
                             ))
                             skipped += 1
                             continue
+                        # Сохраняем snapshot full_text ДО применения правки для контекста
+                        full_text_snapshot = self.mapper.full_text
                         # Получаем matched_text для обратной связи
-                        matched_text = self.mapper.full_text[start_idx:end_idx]
-                        # Формируем CriticMarkup
+                        matched_text = full_text_snapshot[start_idx:end_idx]
+                        # Формируем CriticMarkup с контекстом
                         context_markup = self._build_context_with_markup(
-                            matched_text, edit.new_text or "",
+                            matched_text,
+                            edit.new_text or "",
+                            start_idx=start_idx,
+                            end_idx=end_idx,
+                            full_text=full_text_snapshot,
                         )
                         if self._apply_single_edit_heuristic(edit):
                             self._last_edit_results.append(EditResult(
