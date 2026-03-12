@@ -10,12 +10,12 @@ from adeu.redline.engine import RedlineEngine
 logger = structlog.get_logger(__name__)
 
 
-def test_repro_accept_deletion_keeps_insertion():
+def test_repro_accept_resolves_paired_modification():
     """
     Scenario:
-    1. Modifying text creates a Deletion (ID 1) and Insertion (ID 2).
-    2. User accepts Deletion (ID 1).
-    3. Insertion (ID 2) MUST remain.
+    1. Modifying text creates a Deletion (ID 1) and paired Insertion (ID 2).
+    2. User targets the Deletion ID to accept.
+    3. The paired Insertion MUST also be resolved (accepted) automatically to mimic Word's atomic handling.
     """
     doc = Document()
     doc.add_paragraph("Old Text")
@@ -30,26 +30,14 @@ def test_repro_accept_deletion_keeps_insertion():
     engine.apply_edits([edit])
 
     stream_edited = engine.save_to_stream()
-
-    # Verify Intermediate State
     text_mid = extract_text_from_stream(stream_edited)
 
-    # Engine optimizes "Old Text" -> "New Text" by keeping common suffix " Text".
-    # Result is effectively: Del("Old") + Ins("New") + Keep(" Text")
     assert "{--Old--}" in text_mid
     assert "{++New++}" in text_mid
 
-    # 2. Accept the Deletion (ID 1)
-    # We need to find the ID. In a clean doc, it starts at 1.
-    # Typically Modification = Del(1) then Ins(2).
-
-    # Debug: Print text to see IDs
-    print(f"Mid Text: {text_mid}")
-
-    # Assuming ID 1 is the deletion (track_delete_run called first)
+    # 2. Accept the Deletion
     import re
 
-    # Matches [Chg:1]
     ids = re.findall(r"\[Chg:(\d+)\]", text_mid)
     del_id = ids[0] if ids else "1"
 
@@ -59,14 +47,14 @@ def test_repro_accept_deletion_keeps_insertion():
 
     stream_final = engine2.save_to_stream()
     text_final = extract_text_from_stream(stream_final)
-    print(f"Final Text: {text_final}")
 
     # Check:
     # 1. Old Text should be GONE (Accepted Deletion)
     assert "Old" not in text_final, "Old Text should be removed"
 
-    # 2. New Text should be PRESENT (Pending Insertion)
-    assert "{++New++}" in text_final, "New Text should still be an insertion"
+    # 2. New Text should be PRESENT as normal text (Accepted paired Insertion)
+    assert "{++New++}" not in text_final, "New Text tracking wrapper should be removed by paired resolution"
+    assert "New Text" in text_final, "New Text content should remain in the document"
 
 
 def test_id_collision_prevention():

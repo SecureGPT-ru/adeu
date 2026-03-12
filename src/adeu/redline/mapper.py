@@ -149,8 +149,8 @@ class DocumentMapper:
         current = start_offset
 
         active_ids: set[str] = set()
-        active_ins_event: Optional[DocxEvent] = None
-        active_del_event: Optional[DocxEvent] = None
+        active_ins: dict[str, DocxEvent] = {}
+        active_del: dict[str, DocxEvent] = {}
 
         deferred_meta_states: List[Tuple] = []
         current_wrappers = ("", "")
@@ -184,14 +184,14 @@ class DocumentMapper:
                     if suffix:
                         run_parts.append(("virtual", suffix, None))
 
-                if self.clean_view and active_del_event:
+                if self.clean_view and active_del:
                     pass
 
                 full_seg_text = "".join(x[1] for x in run_parts)
 
                 # Initialize IDs safely before use
-                curr_ins_id = active_ins_event.id if active_ins_event else None
-                curr_del_id = active_del_event.id if active_del_event else None
+                curr_ins_id = list(active_ins.keys())[-1] if active_ins else None
+                curr_del_id = list(active_del.keys())[-1] if active_del else None
 
                 if full_seg_text and not (self.clean_view and curr_del_id):
                     if self.clean_view:
@@ -237,8 +237,8 @@ class DocumentMapper:
                 # Metadata Handling
                 if not self.clean_view:
                     state_snapshot = (
-                        ({active_ins_event.id: active_ins_event} if active_ins_event else {}),
-                        ({active_del_event.id: active_del_event} if active_del_event else {}),
+                        active_ins.copy(),
+                        active_del.copy(),
                         active_ids.copy(),
                     )
                     deferred_meta_states.append(state_snapshot)
@@ -249,24 +249,25 @@ class DocumentMapper:
                     if is_redline:
                         j = i + 1
                         next_is_redline = False
-                        temp_ins = bool(curr_ins_id)
-                        temp_del = bool(curr_del_id)
+                        # Use counters to handle nested tag closures safely during lookahead
+                        temp_ins_count = len(active_ins)
+                        temp_del_count = len(active_del)
 
                         while j < len(items):
                             next_item = items[j]
                             if isinstance(next_item, Run):
-                                if temp_ins or temp_del:
+                                if temp_ins_count > 0 or temp_del_count > 0:
                                     next_is_redline = True
                                 break
                             elif isinstance(next_item, DocxEvent):
                                 if next_item.type == "ins_start":
-                                    temp_ins = True
+                                    temp_ins_count += 1
                                 elif next_item.type == "ins_end":
-                                    temp_ins = False
+                                    temp_ins_count = max(0, temp_ins_count - 1)
                                 elif next_item.type == "del_start":
-                                    temp_del = True
+                                    temp_del_count += 1
                                 elif next_item.type == "del_end":
-                                    temp_del = False
+                                    temp_del_count = max(0, temp_del_count - 1)
                             j += 1
 
                         if next_is_redline:
@@ -341,13 +342,13 @@ class DocumentMapper:
                     if item.id in active_ids:
                         active_ids.remove(item.id)
                 elif item.type == "ins_start":
-                    active_ins_event = item
+                    active_ins[item.id] = item
                 elif item.type == "ins_end":
-                    active_ins_event = None
+                    active_ins.pop(item.id, None)
                 elif item.type == "del_start":
-                    active_del_event = item
+                    active_del[item.id] = item
                 elif item.type == "del_end":
-                    active_del_event = None
+                    active_del.pop(item.id, None)
 
         # Final Flush
         if pending_runs:
@@ -525,6 +526,43 @@ class DocumentMapper:
             pass
 
         return -1, 0
+
+    def find_all_match_indices(self, target_text: str) -> List[Tuple[int, int]]:
+        """
+        Returns a list of all non-overlapping matches as (start_index, match_length).
+        Returns an empty list if not found.
+        """
+        if not target_text:
+            return []
+
+        # 1. Exact Match
+        matches = [m.span() for m in re.finditer(re.escape(target_text), self.full_text)]
+        if matches:
+            return [(s, e - s) for s, e in matches]
+
+        # 2. Smart Quote Normalization
+        norm_full = self._replace_smart_quotes(self.full_text)
+        norm_target = self._replace_smart_quotes(target_text)
+        matches = [m.span() for m in re.finditer(re.escape(norm_target), norm_full)]
+        if matches:
+            return [(s, e - s) for s, e in matches]
+
+        # 3. Strip markdown from target
+        stripped_target = self._strip_markdown_formatting(target_text)
+        matches = [m.span() for m in re.finditer(re.escape(stripped_target), self.full_text)]
+        if matches:
+            return [(s, e - s) for s, e in matches]
+
+        # 4. Fuzzy Regex Match
+        try:
+            pattern = self._make_fuzzy_regex(target_text)
+            matches = [m.span() for m in re.finditer(pattern, self.full_text)]
+            if matches:
+                return [(s, e - s) for s, e in matches]
+        except re.error:
+            pass
+
+        return []
 
     def find_target_runs(self, target_text: str) -> List[Run]:
         start_idx, length = self.find_match_index(target_text)

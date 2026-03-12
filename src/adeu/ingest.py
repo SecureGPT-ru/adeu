@@ -161,7 +161,11 @@ def _build_paragraph_text(paragraph, comments_map, clean_view: bool = False):
                 # unless we want to support comments in clean view?
                 # For now, Clean View implies "Final Document Text", so no inline metadata.
                 if not clean_view:
-                    current_state = (active_ins.copy(), active_del.copy(), active_comments.copy())
+                    current_state = (
+                        active_ins.copy(),
+                        active_del.copy(),
+                        active_comments.copy(),
+                    )
                     deferred_meta_states.append(current_state)
 
                     should_defer = False
@@ -172,24 +176,25 @@ def _build_paragraph_text(paragraph, comments_map, clean_view: bool = False):
                         j = i + 1
                         next_is_redline = False
 
-                        temp_ins = bool(active_ins)
-                        temp_del = bool(active_del)
+                        # Use counters to prevent nested closures from falsely zeroing state
+                        temp_ins_count = len(active_ins)
+                        temp_del_count = len(active_del)
 
                         while j < len(items):
                             next_item = items[j]
                             if isinstance(next_item, Run):
-                                if temp_ins or temp_del:
+                                if temp_ins_count > 0 or temp_del_count > 0:
                                     next_is_redline = True
                                 break
                             elif isinstance(next_item, DocxEvent):
                                 if next_item.type == "ins_start":
-                                    temp_ins = True
+                                    temp_ins_count += 1
                                 elif next_item.type == "ins_end":
-                                    temp_ins = False
+                                    temp_ins_count = max(0, temp_ins_count - 1)
                                 elif next_item.type == "del_start":
-                                    temp_del = True
+                                    temp_del_count += 1
                                 elif next_item.type == "del_end":
-                                    temp_del = False
+                                    temp_del_count = max(0, temp_del_count - 1)
                             j += 1
 
                         if next_is_redline:

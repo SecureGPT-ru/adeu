@@ -165,6 +165,56 @@ class RedlineEngine:
         """
         return f"{{--{matched_text}--}}{{++{new_text}++}}"
 
+    def _get_paired_nodes(self, node):
+        """
+        Finds all contiguous w:ins/w:del nodes that form a single logical Modification block.
+        This handles cases where a modification spans multiple runs (producing multiple w:del tags)
+        followed by a w:ins tag, ensuring they are accepted/rejected atomically.
+        """
+        pairs = set()
+        author = node.get(qn("w:author"))
+
+        # Look forward
+        nxt = node.getnext()
+        while nxt is not None:
+            if nxt.tag in (
+                qn("w:commentRangeStart"),
+                qn("w:commentRangeEnd"),
+                qn("w:commentReference"),
+                qn("w:rPr"),
+                qn("w:pPr"),
+            ):
+                nxt = nxt.getnext()
+                continue
+            if nxt.tag in (qn("w:ins"), qn("w:del")):
+                # Group contiguous edits by the same author
+                if nxt.get(qn("w:author")) == author:
+                    pairs.add(nxt)
+                    nxt = nxt.getnext()
+                    continue
+            break
+
+        # Look backward
+        prev = node.getprevious()
+        while prev is not None:
+            if prev.tag in (
+                qn("w:commentRangeStart"),
+                qn("w:commentRangeEnd"),
+                qn("w:commentReference"),
+                qn("w:rPr"),
+                qn("w:pPr"),
+            ):
+                prev = prev.getprevious()
+                continue
+            if prev.tag in (qn("w:ins"), qn("w:del")):
+                if prev.get(qn("w:author")) == author:
+                    pairs.add(prev)
+                    prev = prev.getprevious()
+                    continue
+            break
+
+        return list(pairs)
+
     def _scan_existing_ids(self) -> int:
         """
         Scans the document body for existing w:id attributes in w:ins and w:del
@@ -285,9 +335,15 @@ class RedlineEngine:
             if not anchor_run:
                 return None
 
+            # Robustly traverse up to the actual w:p tag, bypassing w:ins/w:del wrappers
             current_p = anchor_run._element.getparent()
+            while current_p is not None and current_p.tag != qn("w:p"):
+                current_p = current_p.getparent()
+
             if current_p is None and hasattr(anchor_run, "_parent"):
-                current_p = getattr(anchor_run._parent, "_element", None)
+                p_obj = anchor_run._parent
+                if hasattr(p_obj, "_element") and p_obj._element.tag == qn("w:p"):
+                    current_p = p_obj._element
 
             if current_p is None:
                 return None
@@ -331,6 +387,7 @@ class RedlineEngine:
                     new_ins.append(new_run)
 
                 new_p.append(new_ins)
+                # RESTORED +1: Insert AFTER the anchor paragraph, matching existing test expectations
                 body.insert(p_index + 1 + i, new_p)
                 created_nodes.append((new_p, new_ins))
 
@@ -356,9 +413,15 @@ class RedlineEngine:
             if not anchor_run:
                 return ins_elem
 
+            # Robustly traverse up to the actual w:p tag, bypassing w:ins/w:del wrappers
             current_p_element = anchor_run._element.getparent()
+            while current_p_element is not None and current_p_element.tag != qn("w:p"):
+                current_p_element = current_p_element.getparent()
+
             if current_p_element is None and hasattr(anchor_run, "_parent"):
-                current_p_element = getattr(anchor_run._parent, "_element", None)
+                p_obj = anchor_run._parent
+                if hasattr(p_obj, "_element") and p_obj._element.tag == qn("w:p"):
+                    current_p_element = p_obj._element
 
             if current_p_element is None:
                 return ins_elem
@@ -454,7 +517,12 @@ class RedlineEngine:
         pPr.append(pStyle)
         p_element.insert(0, pPr)
 
-    def _track_insert_inline(self, text: str, anchor_run: Optional[Run] = None, suppress_inherited: bool = False):
+    def _track_insert_inline(
+        self,
+        text: str,
+        anchor_run: Optional[Run] = None,
+        suppress_inherited: bool = False,
+    ):
         ins = self._create_track_change_tag("w:ins")
 
         segments = self._parse_inline_markdown(text)
@@ -474,6 +542,46 @@ class RedlineEngine:
 
         return ins
 
+    def _insert_and_split_ins(self, parent_ins, split_index: int, new_elem):
+        """
+        Splits a w:ins element to insert a new element (like w:del or another w:ins)
+        without creating invalid nested w:ins tags.
+        """
+        grandparent = parent_ins.getparent()
+        if grandparent is None:
+            return
+
+        parent_index = grandparent.index(parent_ins)
+
+        left_ins = create_element("w:ins")
+        for attr, val in parent_ins.attrib.items():
+            left_ins.set(attr, val)
+
+        right_ins = create_element("w:ins")
+        for attr, val in parent_ins.attrib.items():
+            right_ins.set(attr, val)
+
+        # Snapshot children to safely extract them across loops
+        children = list(parent_ins)
+        for child in children[:split_index]:
+            left_ins.append(child)
+        for child in children[split_index:]:
+            right_ins.append(child)
+
+        insert_idx = parent_index
+        if len(left_ins) > 0:
+            grandparent.insert(insert_idx, left_ins)
+            insert_idx += 1
+
+        if new_elem is not None:
+            grandparent.insert(insert_idx, new_elem)
+            insert_idx += 1
+
+        if len(right_ins) > 0:
+            grandparent.insert(insert_idx, right_ins)
+
+        grandparent.remove(parent_ins)
+
     def track_delete_run(self, run: Run):
         del_tag = self._create_track_change_tag("w:del")
         new_run = create_element("w:r")
@@ -484,9 +592,47 @@ class RedlineEngine:
         self._set_text_content(del_text, text_content)
         new_run.append(del_text)
         del_tag.append(new_run)
+
         parent = run._r.getparent()
         if parent is None:
             return None
+
+        if parent.tag == qn("w:ins"):
+            grandparent = parent.getparent()
+            if grandparent is not None:
+                parent_index = grandparent.index(parent)
+                run_index = parent.index(run._r)
+
+                left_ins = create_element("w:ins")
+                for attr, val in parent.attrib.items():
+                    left_ins.set(attr, val)
+
+                right_ins = create_element("w:ins")
+                for attr, val in parent.attrib.items():
+                    right_ins.set(attr, val)
+
+                # Snapshot children to safely extract them across loops
+                children = list(parent)
+                for child in children[:run_index]:
+                    left_ins.append(child)
+                # Skip the run being deleted
+                for child in children[run_index + 1 :]:
+                    right_ins.append(child)
+
+                insert_idx = parent_index
+                if len(left_ins) > 0:
+                    grandparent.insert(insert_idx, left_ins)
+                    insert_idx += 1
+
+                grandparent.insert(insert_idx, del_tag)
+                insert_idx += 1
+
+                if len(right_ins) > 0:
+                    grandparent.insert(insert_idx, right_ins)
+
+                grandparent.remove(parent)
+                return del_tag
+
         parent.replace(run._r, del_tag)
         return del_tag
 
@@ -550,6 +696,59 @@ class RedlineEngine:
             end_p.insert(idx_end + 2, ref_run)
         except ValueError:
             pass
+
+    def validate_edits(self, edits: List[DocumentEdit]) -> List[str]:
+        """
+        Performs an exhaustive dry-run validation of all text edits in the batch.
+        Returns a list of error strings. If the list is empty, the batch is safe to apply.
+        """
+        errors = []
+
+        # Ensure base mapper is ready
+        self.mapper._build_map()
+
+        for i, edit in enumerate(edits):
+            if not edit.target_text:
+                continue  # Skip validation for pure index-based insertions
+
+            matches = self.mapper.find_all_match_indices(edit.target_text)
+            active_text = self.mapper.full_text
+
+            # Fallback to Clean View if not found in Raw View (matches heuristic logic)
+            if len(matches) == 0:
+                if not self.clean_mapper:
+                    self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
+                matches = self.clean_mapper.find_all_match_indices(edit.target_text)
+                if len(matches) > 0:
+                    active_text = self.clean_mapper.full_text
+
+            if len(matches) == 0:
+                errors.append(f'- Edit {i + 1} Failed: Target text not found in document:\n  "{edit.target_text}"')
+            elif len(matches) > 1:
+                error_msg = [
+                    f"- Edit {i + 1} Failed: Ambiguous match. Target text appears "
+                    f"{len(matches)} times. Occurrences found at:"
+                ]
+
+                for idx, (start, length) in enumerate(matches):
+                    end = start + length
+                    # Extract context (~50 chars before and after to ensure full clause names are captured)
+                    pre_context = active_text[max(0, start - 50) : start].replace("\n", " ")
+                    post_context = active_text[end : min(len(active_text), end + 50)].replace("\n", " ")
+                    match_text = active_text[start:end].replace("\n", " ")
+
+                    # Truncate match_text if it's extremely long for the error report
+                    if len(match_text) > 50:
+                        match_text = match_text[:25] + "..." + match_text[-20:]
+
+                    error_msg.append(f'    {idx + 1}. "...{pre_context}[{match_text}]{post_context}..."')
+
+                error_msg.append(
+                    "  Please provide more surrounding context in your target_text to uniquely identify the location."
+                )
+                errors.append("\n".join(error_msg))
+
+        return errors
 
     def apply_edits(self, edits: List[DocumentEdit]) -> tuple[int, int]:
         # Очищаем результаты предыдущего вызова
@@ -704,30 +903,6 @@ class RedlineEngine:
         else:
             active_mapper = self.mapper
 
-        # --- HEURISTIC NESTED EDIT FIX ---
-        context_span = active_mapper.get_context_at_range(start_idx, start_idx + match_len)
-
-        if context_span and context_span.ins_id:
-            ins_id = context_span.ins_id
-            ins_spans = [s for s in active_mapper.spans if s.ins_id == ins_id]
-            if ins_spans:
-                ins_start = ins_spans[0].start
-                full_ins_text = "".join(s.text for s in ins_spans)
-                rel_start = start_idx - ins_start
-
-                expanded_new_text = (
-                    full_ins_text[:rel_start] + (edit.new_text or "") + full_ins_text[rel_start + match_len :]
-                )
-
-                proxy_edit = DocumentEdit(
-                    target_text=full_ins_text,
-                    new_text=expanded_new_text,
-                    comment=edit.comment,
-                )
-                proxy_edit._match_start_index = ins_start
-                return self._apply_single_edit_indexed(proxy_edit)
-        # ---------------------------------
-
         effective_new_text = edit.new_text or ""
         actual_doc_text = self.mapper.full_text[start_idx : start_idx + match_len]
 
@@ -783,35 +958,43 @@ class RedlineEngine:
 
         logger.debug(f"Applying Edit at [{start_idx}:{start_idx + length}] Op={op}")
 
-        if length > 0:
-            context_span = self.mapper.get_context_at_range(start_idx, start_idx + length)
-            if context_span and context_span.ins_id:
-                logger.info(f"Detected edit inside Insertion ID={context_span.ins_id}. Converting to Replace.")
-                ins_id = context_span.ins_id
-                ins_nodes = self.doc.element.xpath(f"//w:ins[@w:id='{ins_id}']")
-                if not ins_nodes:
-                    return False
+        if op == EditOperationType.INSERTION:
+            anchor_run = self.mapper.get_insertion_anchor(start_idx)
+            if not anchor_run:
+                return False
 
-                first_node = ins_nodes[0]
-                parent = first_node.getparent()
-                index = parent.index(first_node)
+            parent = anchor_run._element.getparent()
+            index = parent.index(anchor_run._element)
 
-                style_source = None
-                r = first_node.find(qn("w:r"))
-                if r is not None:
-                    style_source = Run(r, parent)
+            final_new_text = edit.new_text or ""
 
-                self._reject_change(ins_id)
-
-                if edit.new_text:
-                    ins_elem = self.track_insert(edit.new_text, anchor_run=style_source, comment=edit.comment)
-                    if ins_elem is not None:
+            if start_idx == 0:
+                ins_elem = self.track_insert(final_new_text, anchor_run=anchor_run, comment=edit.comment)
+                if ins_elem is not None:
+                    if parent.tag == qn("w:ins"):
+                        self._insert_and_split_ins(parent, index, ins_elem)
+                        actual_parent = parent.getparent()
+                    else:
                         parent.insert(index, ins_elem)
+                        actual_parent = parent
 
-                    if edit.comment and ins_elem is not None:
-                        self._attach_comment(parent, ins_elem, ins_elem, edit.comment)
+                    if edit.comment:
+                        self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+            else:
+                next_run = self._get_next_run(anchor_run)
+                style_run = self._determine_style_source(anchor_run, next_run, final_new_text)
+                ins_elem = self.track_insert(final_new_text, anchor_run=style_run, comment=edit.comment)
+                if ins_elem is not None:
+                    if parent.tag == qn("w:ins"):
+                        self._insert_and_split_ins(parent, index + 1, ins_elem)
+                        actual_parent = parent.getparent()
+                    else:
+                        parent.insert(index + 1, ins_elem)
+                        actual_parent = parent
 
-                return True
+                    if edit.comment:
+                        self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+            return True
 
         if op == EditOperationType.INSERTION:
             anchor_run = self.mapper.get_insertion_anchor(start_idx)
@@ -914,6 +1097,7 @@ class RedlineEngine:
     def apply_review_actions(self, actions: List[ReviewAction]) -> tuple[int, int]:
         applied = 0
         skipped = 0
+        resolved_history = set()
 
         for act in actions:
             raw_id = act.target_id
@@ -932,57 +1116,195 @@ class RedlineEngine:
                 is_change = True
                 is_comment = True
 
+            # If this edit was already swept up in a paired resolution, mark as applied and skip
+            if is_change and target_id in resolved_history:
+                applied += 1
+                continue
+
+            resolved_now = set()
             success = False
+
             if act.action == "ACCEPT":
                 if is_change:
-                    success = self._accept_change(target_id)
+                    resolved_now = self._accept_change(target_id)
+                    success = bool(resolved_now)
             elif act.action == "REJECT":
                 if is_change:
-                    success = self._reject_change(target_id)
+                    resolved_now = self._reject_change(target_id)
+                    success = bool(resolved_now)
             elif act.action == "REPLY":
                 if is_comment:
                     success = self._reply_to_comment(target_id, act.text or "")
 
             if success:
+                if resolved_now:
+                    resolved_history.update(resolved_now)
                 applied += 1
             else:
                 skipped += 1
 
+        if applied > 0:
+            normalize_docx(self.doc)
+
         return applied, skipped
 
-    def _accept_change(self, target_id: str) -> bool:
-        ins_nodes = self.doc.element.xpath(f"//w:ins[@w:id='{target_id}']")
-        for ins in ins_nodes:
+    def _clean_wrapping_comments(self, element):
+        """
+        Removes comment anchors that tightly wrap this element (or a paired del/ins).
+        This prevents orphaned comment ranges from leaking when an edit is accepted/rejected.
+        """
+        # 1. Collect tightly adjacent Start anchors (looking backwards)
+        starts_to_remove = []
+        prev = element.getprevious()
+        while prev is not None:
+            if prev.tag == qn("w:commentRangeStart"):
+                starts_to_remove.append(prev)
+                prev = prev.getprevious()
+            elif prev.tag in (qn("w:rPr"), qn("w:pPr")):
+                prev = prev.getprevious()
+            else:
+                break
+
+        # 2. Collect tightly adjacent End/Ref anchors (looking forwards)
+        ends_to_remove = []
+        nxt = element.getnext()
+        while nxt is not None:
+            if nxt.tag == qn("w:commentRangeEnd"):
+                ends_to_remove.append(nxt)
+                nxt = nxt.getnext()
+            elif nxt.tag == qn("w:r") and nxt.find(f".//{qn('w:commentReference')}") is not None:
+                ends_to_remove.append(nxt)
+                nxt = nxt.getnext()
+            elif nxt.tag == qn("w:commentReference"):
+                ends_to_remove.append(nxt)
+                nxt = nxt.getnext()
+            elif nxt.tag in (qn("w:ins"), qn("w:del")):
+                # Skip over the rest of the paired edit block to find the ending anchor
+                nxt = nxt.getnext()
+            else:
+                break
+
+        # 3. Match pairs and delete
+        end_ids = set()
+        for e in ends_to_remove:
+            if e.tag == qn("w:commentRangeEnd"):
+                end_ids.add(e.get(qn("w:id")))
+            else:
+                ref = e.find(f".//{qn('w:commentReference')}")
+                if ref is None and e.tag == qn("w:commentReference"):
+                    ref = e
+                if ref is not None:
+                    end_ids.add(ref.get(qn("w:id")))
+
+        for s in starts_to_remove:
+            c_id = s.get(qn("w:id"))
+            if c_id and c_id in end_ids:
+                self.comments_manager.delete_comment(c_id)
+                if s.getparent() is not None:
+                    s.getparent().remove(s)
+                for e in ends_to_remove:
+                    e_id = None
+                    if e.tag == qn("w:commentRangeEnd"):
+                        e_id = e.get(qn("w:id"))
+                    else:
+                        ref = e.find(f".//{qn('w:commentReference')}")
+                        if ref is None and e.tag == qn("w:commentReference"):
+                            ref = e
+                        if ref is not None:
+                            e_id = ref.get(qn("w:id"))
+
+                    if e_id == c_id and e.getparent() is not None:
+                        e.getparent().remove(e)
+
+    def _delete_comments_in_element(self, element):
+        """
+        Scans a DOM element scheduled for deletion for strictly encapsulated comment references.
+        """
+        refs = element.findall(f".//{qn('w:commentReference')}")
+        for ref in refs:
+            c_id = ref.get(qn("w:id"))
+            if c_id:
+                self.comments_manager.delete_comment(c_id)
+                for tag in ["w:commentRangeStart", "w:commentRangeEnd"]:
+                    for node in self.doc.element.findall(f".//{qn(tag)}"):
+                        if node.get(qn("w:id")) == c_id and node.getparent() is not None:
+                            node.getparent().remove(node)
+
+    def _accept_change(self, target_id: str) -> set:
+        primary_ins = [n for n in self.doc.element.findall(f".//{qn('w:ins')}") if n.get(qn("w:id")) == target_id]
+        primary_del = [n for n in self.doc.element.findall(f".//{qn('w:del')}") if n.get(qn("w:id")) == target_id]
+
+        all_ins = set(primary_ins)
+        all_del = set(primary_del)
+
+        for node in primary_ins + primary_del:
+            for paired in self._get_paired_nodes(node):
+                if paired.tag == qn("w:ins"):
+                    all_ins.add(paired)
+                elif paired.tag == qn("w:del"):
+                    all_del.add(paired)
+
+        resolved_ids = set()
+        for node in all_ins | all_del:
+            resolved_ids.add(node.get(qn("w:id")))
+
+        for ins in all_ins:
+            self._clean_wrapping_comments(ins)
             parent = ins.getparent()
+            if parent is None:
+                continue
             index = parent.index(ins)
             for child in list(ins):
                 parent.insert(index, child)
                 index += 1
             parent.remove(ins)
 
-        del_nodes = self.doc.element.xpath(f"//w:del[@w:id='{target_id}']")
-        for d in del_nodes:
-            d.getparent().remove(d)
+        for d in all_del:
+            self._clean_wrapping_comments(d)
+            self._delete_comments_in_element(d)
+            if d.getparent() is not None:
+                d.getparent().remove(d)
 
-        return bool(ins_nodes or del_nodes)
+        return resolved_ids
 
-    def _reject_change(self, target_id: str) -> bool:
-        ins_nodes = self.doc.element.xpath(f"//w:ins[@w:id='{target_id}']")
-        for ins in ins_nodes:
-            ins.getparent().remove(ins)
+    def _reject_change(self, target_id: str) -> set:
+        primary_ins = [n for n in self.doc.element.findall(f".//{qn('w:ins')}") if n.get(qn("w:id")) == target_id]
+        primary_del = [n for n in self.doc.element.findall(f".//{qn('w:del')}") if n.get(qn("w:id")) == target_id]
 
-        del_nodes = self.doc.element.xpath(f"//w:del[@w:id='{target_id}']")
-        for d in del_nodes:
+        all_ins = set(primary_ins)
+        all_del = set(primary_del)
+
+        for node in primary_ins + primary_del:
+            for paired in self._get_paired_nodes(node):
+                if paired.tag == qn("w:ins"):
+                    all_ins.add(paired)
+                elif paired.tag == qn("w:del"):
+                    all_del.add(paired)
+
+        resolved_ids = set()
+        for node in all_ins | all_del:
+            resolved_ids.add(node.get(qn("w:id")))
+
+        for ins in all_ins:
+            self._clean_wrapping_comments(ins)
+            self._delete_comments_in_element(ins)
+            if ins.getparent() is not None:
+                ins.getparent().remove(ins)
+
+        for d in all_del:
+            self._clean_wrapping_comments(d)
             parent = d.getparent()
+            if parent is None:
+                continue
             index = parent.index(d)
             for child in list(d):
-                for dt in child.findall(qn("w:delText")):
+                for dt in child.findall(f".//{qn('w:delText')}"):
                     dt.tag = qn("w:t")
                 parent.insert(index, child)
                 index += 1
             parent.remove(d)
 
-        return bool(ins_nodes or del_nodes)
+        return resolved_ids
 
     def _reply_to_comment(self, target_id: str, text: str) -> bool:
         if not self.comments_manager.comments_part:
@@ -1045,8 +1367,19 @@ class RedlineEngine:
             parent.remove(ins)
 
         for d in self.doc.element.xpath("//w:del"):
+            self._delete_comments_in_element(d)
             d.getparent().remove(d)
 
+        # 1. Purge all remaining comments from the comment manager XML parts
+        # FIX: Use findall with qn()
+        for ref in self.doc.element.findall(f".//{qn('w:commentReference')}"):
+            c_id = ref.get(qn("w:id"))
+            if c_id:
+                self.comments_manager.delete_comment(c_id)
+
+        # 2. Strip all stray comment tags from the document body
         for tag in ["w:commentRangeStart", "w:commentRangeEnd", "w:commentReference"]:
-            for el in self.doc.element.xpath(f"//{(tag)}"):
-                el.getparent().remove(el)
+            # FIX: Use findall with qn()
+            for el in self.doc.element.findall(f".//{qn(tag)}"):
+                if el.getparent() is not None:
+                    el.getparent().remove(el)
