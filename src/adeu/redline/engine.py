@@ -741,12 +741,12 @@ class RedlineEngine:
                 ]
                 for idx, (start, length) in enumerate(matches):
                     end = start + length
-                    # Extract context (~30 chars before and after)
-                    pre_context = active_text[max(0, start - 30) : start].replace(
+                    # Extract context (~50 chars before and after to ensure full clause names are captured)
+                    pre_context = active_text[max(0, start - 50) : start].replace(
                         "\n", " "
                     )
                     post_context = active_text[
-                        end : min(len(active_text), end + 30)
+                        end : min(len(active_text), end + 50)
                     ].replace("\n", " ")
                     match_text = active_text[start:end].replace("\n", " ")
 
